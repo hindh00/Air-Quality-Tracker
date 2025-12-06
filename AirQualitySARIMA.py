@@ -127,11 +127,20 @@ def fit_sarima(df, region, variable="pm2_5 (μg/m³)", seasonal_period=24, forec
     """
     region_data = df[df['region'] == region].set_index('time').sort_index()
     auto = auto_arima(
-            region_data[variable],
-            seasonal=True,
-            m=seasonal_period,
-            trace=True,
-        )
+        region_data[variable],
+        seasonal=True,
+        m=seasonal_period,
+        max_p=2,              # Limit AR terms
+        max_q=2,              # Limit MA terms
+        max_P=1,              # Limit seasonal AR
+        max_Q=1,              # Limit seasonal MA
+        max_d=1,              # Limit differencing
+        max_D=1,              # Limit seasonal differencing
+        stepwise=True,
+        trace=True,
+        n_jobs=1,             # Single core to reduce memory
+        suppress_warnings=True
+    )
     order = auto.order
     seasonal_order = auto.seasonal_order
     print(f"Selected order: {order}, seasonal_order: {seasonal_order}")
