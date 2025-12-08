@@ -1,1 +1,13 @@
-".venv/ *.pyc __pycache__/ .pytest_cache/ .coverage htmlcov/ *.egg-info/ dist/ build/" 
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
