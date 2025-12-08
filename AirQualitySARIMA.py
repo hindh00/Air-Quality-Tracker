@@ -3,7 +3,8 @@ import pandas as pd
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from pmdarima import auto_arima
 import pickle
-
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import numpy as np
 
 df = pd.read_csv('final_training_data_all_regions.csv')
 df["time"] = pd.to_datetime(df["time"])
@@ -103,7 +104,7 @@ def plot_timeseries_resampled(df, variable, regions="all", freq="D"):
 # might have long term trends as well
 
 
-def fit_sarima(df, region, variable="pm2_5 (μg/m³)", seasonal_period=24, forecast_steps=None):
+def fit_sarima(df, region, variable="pm2_5 (μg/m³)", seasonal_period=24, forecast_steps=None, months_back=6):
     """
     Automated SARIMA model fitting for a specific region and variable.
 
@@ -119,6 +120,8 @@ def fit_sarima(df, region, variable="pm2_5 (μg/m³)", seasonal_period=24, forec
         The length of the seasonality, default=24 (hourly data with daily seasonality).
     forecast_steps : int or None
         If provided, generate and return forecast for this many steps.
+    months_back : int
+        Number of recent months to use for training (default=6).
 
     Returns
     -------
@@ -126,19 +129,23 @@ def fit_sarima(df, region, variable="pm2_5 (μg/m³)", seasonal_period=24, forec
         Contains 'model_results', 'order', 'seasonal_order', and optionally 'forecast'.
     """
     region_data = df[df['region'] == region].set_index('time').sort_index()
+    
+    recent_data = region_data[variable].tail(24 * 30 * months_back)
+    print(f"Training on {len(recent_data)} data points ({months_back} months)")
+    
     auto = auto_arima(
-        region_data[variable],
+        recent_data,
         seasonal=True,
         m=seasonal_period,
-        max_p=2,              # Limit AR terms
-        max_q=2,              # Limit MA terms
-        max_P=1,              # Limit seasonal AR
-        max_Q=1,              # Limit seasonal MA
-        max_d=1,              # Limit differencing
-        max_D=1,              # Limit seasonal differencing
+        max_p=2,              
+        max_q=2,
+        max_P=1,
+        max_Q=1,
+        max_d=1,
+        max_D=1,
         stepwise=True,
         trace=True,
-        n_jobs=1,             # Single core to reduce memory
+        n_jobs=1,
         suppress_warnings=True
     )
     order = auto.order
@@ -147,7 +154,7 @@ def fit_sarima(df, region, variable="pm2_5 (μg/m³)", seasonal_period=24, forec
 
     print(f"Fitting SARIMA model for {region}...")
     model = SARIMAX(
-        region_data[variable],
+        recent_data,
         order=order,
         seasonal_order=seasonal_order,
         enforce_stationarity=False,
@@ -245,7 +252,7 @@ def load_models(filename='sarima_models.pkl'):
 
 
 def plot_forecast(df, region, model_results, variable="pm2_5 (μg/m³)", 
-                  forecast_steps=24, show_history_hours=168):
+                  forecast_steps=24, show_history_hours=168, save_path=None):
     """
     Plot historical data and forecast for a single region.
 
@@ -263,6 +270,9 @@ def plot_forecast(df, region, model_results, variable="pm2_5 (μg/m³)",
         Number of steps to forecast into the future.
     show_history_hours : int
         How many hours of historical data to show (default=168, one week).
+    save_path : str or None
+        If provided, save the plot to this file path (e.g., "forecast_doha.png").
+        If None, just display the plot.
     """
     region_data = df[df['region'] == region].set_index('time').sort_index()
     
@@ -294,11 +304,138 @@ def plot_forecast(df, region, model_results, variable="pm2_5 (μg/m³)",
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Plot saved to {save_path}")
+    
     plt.show()
 
 
-result = fit_sarima(df, region="doha", forecast_steps=24)
-save_models(result, "sarima_doha_model.pkl")
+def test_model_performance(df, region, variable="pm2_5 (μg/m³)", seasonal_period=168, 
+                   months_back=6, test_hours=168, save_plot_path=None):
+    """
+    Train SARIMA model and evaluate on held-out test data.
 
-loaded_model = load_models(filename='sarima_doha_model.pkl')
-plot_forecast(df, "doha", loaded_model['model_results'], forecast_steps=24)
+    Parameters
+    ----------
+    df : pandas DataFrame
+        Must contain columns ['region', 'time', variable].
+    region : str
+        The region to analyze.
+    variable : str
+        The column to model.
+    seasonal_period : int
+        The length of the seasonality.
+    months_back : int
+        Total months of recent data to use.
+    test_hours : int
+        Number of hours to hold out for testing (default=168, one week).
+    save_plot_path : str or None
+        If provided, save the evaluation plot to this path.
+
+    Returns
+    -------
+    dict
+        Contains metrics, predictions, and model results.
+    """
+    print(f"Evaluating SARIMA model for {region}")
+    region_data = df[df['region'] == region].set_index('time').sort_index()
+    recent_data = region_data[variable].tail(24 * 30 * months_back)
+
+    train_data = recent_data[:-test_hours]
+    test_data = recent_data[-test_hours:]
+
+    print("\nFinding optimal parameters...")
+    auto = auto_arima(
+        train_data,
+        seasonal=True,
+        m=seasonal_period,
+        start_p=0, start_q=0,
+        max_p=2, max_q=2,
+        start_P=0, start_Q=0,
+        max_P=1, max_Q=1,
+        d=1, D=1,
+        stepwise=True,
+        trace=True,
+        n_jobs=1,
+        suppress_warnings=True,
+    )
+    order = auto.order
+    seasonal_order = auto.seasonal_order
+    print(f"Selected order: {order}, seasonal_order: {seasonal_order}")
+
+    print(f"\nFitting SARIMA model...")
+    model = SARIMAX(
+        train_data,
+        order=order,
+        seasonal_order=seasonal_order,
+        enforce_stationarity=False,
+        enforce_invertibility=False
+    )
+    results = model.fit(disp=False)
+    
+    print(f"Generating {test_hours}-hour forecast...")
+    forecast = results.forecast(steps=test_hours)
+    
+    # Calculate metrics
+    mae = mean_absolute_error(test_data, forecast)
+    mse = mean_squared_error(test_data, forecast)
+    rmse = np.sqrt(mse)
+    mape = np.mean(np.abs((test_data - forecast) / test_data)) * 100
+
+    
+    print(f"Model performance for {region} over last {months_back} month(s):")
+    print(f"MAE:  {mae:.4f} μg/m³")
+    print(f"MSE:  {mse:.4f}")
+    print(f"RMSE: {rmse:.4f} μg/m³")
+    print(f"MAPE: {mape:.2f}%")
+
+    plt.figure(figsize=(14, 6))
+    plt.plot(test_data.index, test_data.values, label='Actual', color='blue', linewidth=2)
+    plt.plot(forecast.index, forecast.values, label='Predicted', color='red', linestyle='--', linewidth=2)
+    
+    plt.xlabel("Time", fontsize=12)
+    plt.ylabel(variable, fontsize=12)
+    plt.title(f"{region} - Actual vs Predicted\nMAE: {mae:.2f}, RMSE: {rmse:.2f}, MAPE: {mape:.2f}%", fontsize=14)
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    if save_plot_path:
+        plt.savefig(save_plot_path, dpi=300, bbox_inches='tight')
+        print(f"Evaluation plot saved to {save_plot_path}")
+    
+    plt.show()
+    
+    return {
+        'model_results': results,
+        'order': order,
+        'seasonal_order': seasonal_order,
+        'predictions': forecast,
+        'actual': test_data,
+        'metrics': {
+            'MAE': mae,
+            'MSE': mse,
+            'RMSE': rmse,
+            'MAPE': mape
+        },
+    }
+
+
+# result = fit_sarima(df, region="doha", forecast_steps=24)
+# save_models(result, "sarima_doha_model.pkl")
+# loaded_model = load_models(filename='sarima_doha_model.pkl')
+# plot_forecast(df, "doha", loaded_model['model_results'], forecast_steps=24)
+
+
+eval_result = test_model_performance(
+    df, "doha", 
+    months_back=6,           # Use 6 months of data
+    test_hours=168,          # Hold out last week for testing
+    save_plot_path="doha_evaluation.png"
+)
+
+# Access results
+print(f"MAE: {eval_result['metrics']['MAE']}")
+print(f"RMSE: {eval_result['metrics']['RMSE']}")
