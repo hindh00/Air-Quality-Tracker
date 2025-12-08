@@ -1,2 +1,1 @@
-"venv/ env/ .env/ *.pyc __pycache__/ .pytest_cache/ .coverage htmlcov/ *.egg-info/ dist/ build/" 
-"venv/ env/ .env/ *.pyc __pycache__/ .pytest_cache/ .coverage htmlcov/ *.egg-info/ dist/ build/" 
+".venv/ *.pyc __pycache__/ .pytest_cache/ .coverage htmlcov/ *.egg-info/ dist/ build/" 

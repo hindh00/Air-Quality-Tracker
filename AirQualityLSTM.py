@@ -1,647 +1,661 @@
-import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, callbacks
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import matplotlib.pyplot as plt
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+import seaborn as sns
+from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-# Check GPU availability and set device
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
-if torch.cuda.is_available():
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"CUDA version: {torch.version.cuda}")
-    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+# Set random seeds for reproducibility
+np.random.seed(42)
+tf.random.set_seed(42)
 
-class AirQualityDataset(Dataset):
-    """Custom Dataset for time series data"""
-    def __init__(self, sequences, targets):
-        self.sequences = sequences
-        self.targets = targets
-    
-    def __len__(self):
-        return len(self.sequences)
-    
-    def __getitem__(self, idx):
-        # Return tensors directly (they'll be moved to GPU in training)
-        return torch.FloatTensor(self.sequences[idx]), torch.FloatTensor(self.targets[idx])
+# ==================== DATA LOADING ====================
+print("Loading data...")
+df = pd.read_csv('final_training_data_all_regions.csv', parse_dates=['time'])
+df = df.sort_values('time')  # Ensure chronological order
 
-class LSTMModel(nn.Module):
-    """LSTM model for multi-step time series forecasting"""
-    def __init__(self, input_size, hidden_size, num_layers, output_steps, dropout=0.2):
-        super(LSTMModel, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.output_steps = output_steps
-        
-        # LSTM layer
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=False
-        )
-        
-        # Dropout layer
-        self.dropout = nn.Dropout(dropout)
-        
-        # Fully connected output layer
-        self.fc = nn.Linear(hidden_size, output_steps * 2)
-        
-    def forward(self, x):
-        batch_size = x.size(0)
-        
-        # Initialize hidden and cell states on the same device as x
-        h0 = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=x.device)
-        c0 = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=x.device)
-        
-        # LSTM forward pass
-        out, (hn, cn) = self.lstm(x, (h0, c0))
-        
-        # Use the last time step's output
-        out = self.dropout(out[:, -1, :])
-        
-        # Predict all time steps for both targets
-        predictions = self.fc(out)
-        
-        # Reshape to (batch_size, output_steps, 2)
-        predictions = predictions.view(batch_size, self.output_steps, 2)
-        
-        return predictions
+# Filter for Doha region only (if you want to focus on one region)
+if 'region' in df.columns:
+    df = df[df['region'] == 'doha'].copy()
+    print(f"Filtered to Doha region: {len(df)} samples")
 
-class AirQualityPredictor:
-    """Main class for air quality prediction with GPU acceleration"""
-    def __init__(self, lookback=168, forecast_horizon=720, region=None):
-        """
-        Args:
-            lookback: Number of hours to look back (default: 1 week = 168 hours)
-            forecast_horizon: Number of hours to predict (default: 1 month = 720 hours)
-            region: If None, train separate models for each region
-        """
-        self.lookback = lookback
-        self.forecast_horizon = forecast_horizon
-        self.region = region
-        self.scalers = {}
-        self.models = {}
-        self.device = device  # Use the global device
+print(f"Data Shape: {df.shape}")
+print(f"Date range: {df['time'].min()} to {df['time'].max()}")
+print(f"Total hours: {len(df)}")
+
+# ==================== DATA PREPARATION ====================
+print("\n" + "="*50)
+print("DATA PREPARATION")
+print("="*50)
+
+# Select features for LSTM (focus on most relevant ones)
+selected_features = [
+    'temperature_2m (°C)',
+    'relative_humidity_2m (%)',
+    'wind_speed_10m (km/h)',
+    'wind_direction_10m (°)',
+    'pm10 (μg/m³)',
+    'carbon_monoxide (μg/m³)',
+    'nitrogen_dioxide (μg/m³)',
+    'ozone (μg/m³)',
+    'dust (μg/m³)',
+    'pm2_5 (μg/m³)'  # Target will be separated later
+]
+
+# Keep only selected features and time
+df_lstm = df[['time'] + selected_features].copy()
+
+# Create time-based features
+df_lstm['hour'] = df_lstm['time'].dt.hour
+df_lstm['day_of_week'] = df_lstm['time'].dt.dayofweek
+df_lstm['month'] = df_lstm['time'].dt.month
+
+# Cyclical encoding
+df_lstm['hour_sin'] = np.sin(2 * np.pi * df_lstm['hour'] / 24)
+df_lstm['hour_cos'] = np.cos(2 * np.pi * df_lstm['hour'] / 24)
+df_lstm['day_sin'] = np.sin(2 * np.pi * df_lstm['day_of_week'] / 7)
+df_lstm['day_cos'] = np.cos(2 * np.pi * df_lstm['day_of_week'] / 7)
+df_lstm['month_sin'] = np.sin(2 * np.pi * df_lstm['month'] / 12)
+df_lstm['month_cos'] = np.cos(2 * np.pi * df_lstm['month'] / 12)
+
+# Add cyclical features to selected features list
+time_features = ['hour_sin', 'hour_cos', 'day_sin', 'day_cos', 'month_sin', 'month_cos']
+
+print(f"\nNumber of original features: {len(selected_features)}")
+print(f"Number of time features: {len(time_features)}")
+
+# Drop rows with missing values
+df_lstm_clean = df_lstm.dropna().copy()
+print(f"\nData after cleaning: {df_lstm_clean.shape} (removed {len(df_lstm) - len(df_lstm_clean)} rows)")
+
+# ==================== CREATE SEQUENCES (CORRECTED) ====================
+def create_sequences_numpy(data_array, sequence_length=24, forecast_horizon=1):
+    """
+    Create sequences from numpy array for LSTM training
     
-    def prepare_features(self, df):
-        """Feature engineering and preprocessing"""
-        df = df.copy()
-        
-        # Convert time and set as index
-        if 'time' in df.columns:
-            df['time'] = pd.to_datetime(df['time'])
-            df = df.set_index('time')
-        
-        # Sort by time
-        df = df.sort_index()
-        
-        # Cyclical encoding for temporal features
-        df['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 24)
-        df['hour_cos'] = np.cos(2 * np.pi * df.index.hour / 24)
-        df['day_sin'] = np.sin(2 * np.pi * df.index.dayofweek / 7)
-        df['day_cos'] = np.cos(2 * np.pi * df.index.dayofweek / 7)
-        df['month_sin'] = np.sin(2 * np.pi * df.index.month / 12)
-        df['month_cos'] = np.cos(2 * np.pi * df.index.month / 12)
-        
-        # Lag features for targets
-        df['pm2_5_lag_24h'] = df['pm2_5 (μg/m³)'].shift(24)
-        df['pm10_lag_24h'] = df['pm10 (μg/m³)'].shift(24)
-        df['pm2_5_lag_168h'] = df['pm2_5 (μg/m³)'].shift(168)
-        df['pm10_lag_168h'] = df['pm10 (μg/m³)'].shift(168)
-        
-        # Rolling statistics
-        df['pm2_5_rolling_24h'] = df['pm2_5 (μg/m³)'].rolling(window=24, min_periods=1).mean()
-        df['pm10_rolling_24h'] = df['pm10 (μg/m³)'].rolling(window=24, min_periods=1).mean()
-        df['pm2_5_rolling_7d'] = df['pm2_5 (μg/m³)'].rolling(window=168, min_periods=1).mean()
-        df['pm10_rolling_7d'] = df['pm10 (μg/m³)'].rolling(window=168, min_periods=1).mean()
-        
-        # Weather interaction features
-        df['wind_dust_interaction'] = df['wind_speed_10m (km/h)'] * df['dust (μg/m³)']
-        df['temp_humidity_interaction'] = df['temperature_2m (°C)'] * df['relative_humidity_2m (%)']
-        
-        # Fill missing values (from lag features)
-        df = df.fillna(method='ffill').fillna(method='bfill')
-        
-        return df
+    Args:
+        data_array: numpy array with all columns (features + target)
+        sequence_length: Number of past hours to use
+        forecast_horizon: Number of hours ahead to predict
     
-    def create_sequences(self, data, targets):
-        """Create sequences for LSTM input"""
-        sequences = []
-        target_sequences = []
-        
-        for i in range(len(data) - self.lookback - self.forecast_horizon + 1):
-            # Input sequence (lookback hours)
-            seq = data[i:(i + self.lookback)]
-            
-            # Target sequence (next forecast_horizon hours)
-            target_seq = targets[(i + self.lookback):(i + self.lookback + self.forecast_horizon)]
-            
-            sequences.append(seq)
-            target_sequences.append(target_seq)
-        
-        return np.array(sequences), np.array(target_sequences)
+    Returns:
+        X: Sequences of features (samples, timesteps, features)
+        y: Target values
+    """
+    X, y = [], []
     
-    def prepare_data(self, df, target_cols=['pm2_5 (μg/m³)', 'pm10 (μg/m³)']):
-        """Prepare data for training"""
-        # Feature engineering
-        df_processed = self.prepare_features(df)
+    for i in range(len(data_array) - sequence_length - forecast_horizon + 1):
+        # Get sequence of features (all columns except last)
+        sequence = data_array[i:i + sequence_length, :-1]  # All columns except last
+        # Get target (last column) at forecast horizon
+        target = data_array[i + sequence_length + forecast_horizon - 1, -1]
         
-        # Select features
-        feature_cols = [
-            'temperature_2m (°C)', 'relative_humidity_2m (%)',
-            'wind_speed_10m (km/h)', 'wind_direction_10m (°)',
-            'precipitation (mm)', 'carbon_monoxide (μg/m³)',
-            'nitrogen_dioxide (μg/m³)', 'sulphur_dioxide (μg/m³)',
-            'ozone (μg/m³)', 'aerosol_optical_depth ()',
-            'dust (μg/m³)', 'hour_sin', 'hour_cos', 'day_sin',
-            'day_cos', 'month_sin', 'month_cos',
-            'pm2_5_lag_24h', 'pm10_lag_24h', 'pm2_5_lag_168h',
-            'pm10_lag_168h', 'pm2_5_rolling_24h', 'pm10_rolling_24h',
-            'pm2_5_rolling_7d', 'pm10_rolling_7d',
-            'wind_dust_interaction', 'temp_humidity_interaction'
-        ]
-        
-        # Filter available columns
-        available_features = [col for col in feature_cols if col in df_processed.columns]
-        
-        # Scale features
-        X = df_processed[available_features].values
-        y = df_processed[target_cols].values
-        
-        # Fit scalers
-        self.scalers['X'] = StandardScaler()
-        self.scalers['y'] = MinMaxScaler()
-        
-        X_scaled = self.scalers['X'].fit_transform(X)
-        y_scaled = self.scalers['y'].fit_transform(y)
-        
-        # Create sequences
-        X_seq, y_seq = self.create_sequences(X_scaled, y_scaled)
-        
-        print(f"Created {len(X_seq)} sequences")
-        print(f"X shape: {X_seq.shape}")
-        print(f"y shape: {y_seq.shape}")
-        
-        return X_seq, y_seq, available_features
+        X.append(sequence)
+        y.append(target)
     
-    def train(self, df, region_name, epochs=100, batch_size=32, learning_rate=0.001):
-        """Train LSTM model for a specific region with GPU acceleration"""
-        print(f"Training model for region: {region_name}")
-        print(f"Using device: {self.device}")
-        
-        # Clear GPU cache before training
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            print(f"GPU Memory allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-        
-        # Prepare data
-        X_seq, y_seq, feature_names = self.prepare_data(df)
-        
-        # Split data (80% train, 10% validation, 10% test)
-        n_samples = len(X_seq)
-        train_size = int(0.8 * n_samples)
-        val_size = int(0.1 * n_samples)
-        
-        X_train, y_train = X_seq[:train_size], y_seq[:train_size]
-        X_val, y_val = X_seq[train_size:train_size+val_size], y_seq[train_size:train_size+val_size]
-        X_test, y_test = X_seq[train_size+val_size:], y_seq[train_size+val_size:]
-        
-        # Create data loaders with GPU optimization
-        train_dataset = AirQualityDataset(X_train, y_train)
-        val_dataset = AirQualityDataset(X_val, y_val)
-        test_dataset = AirQualityDataset(X_test, y_test)
-        
-        # Optimize batch size for GPU
-        if torch.cuda.is_available():
-            batch_size = min(64, batch_size * 2)  # Larger batches for GPU
-        
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=batch_size, 
-            shuffle=True,
-            pin_memory=True,  # Faster data transfer to GPU
-            num_workers=2     # Parallel data loading
-        )
-        
-        val_loader = DataLoader(
-            val_dataset, 
-            batch_size=batch_size, 
-            shuffle=False,
-            pin_memory=True,
-            num_workers=2
-        )
-        
-        test_loader = DataLoader(
-            test_dataset, 
-            batch_size=batch_size, 
-            shuffle=False,
-            pin_memory=True,
-            num_workers=2
-        )
-        
-        # Initialize model and move to GPU
-        input_size = X_train.shape[2]
-        model = LSTMModel(
-            input_size=input_size,
-            hidden_size=128,
-            num_layers=2,
-            output_steps=self.forecast_horizon,
-            dropout=0.3
-        ).to(self.device)  # This moves the model to GPU
-        
-        print(f"Model architecture:")
-        print(f"  Input size: {input_size}")
-        print(f"  Hidden size: 128")
-        print(f"  Output shape: (batch_size, {self.forecast_horizon}, 2)")
-        print(f"  Model moved to: {next(model.parameters()).device}")
-        
-        # Loss and optimizer
-        criterion = nn.MSELoss()
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
-        
-        # Training loop with GPU acceleration
-        train_losses = []
-        val_losses = []
-        
-        import time
-        total_start_time = time.time()
-        
-        for epoch in range(epochs):
-            epoch_start_time = time.time()
-            
-            # Training
-            model.train()
-            train_loss = 0
-            
-            for batch_X, batch_y in train_loader:
-                # Move batch to GPU
-                batch_X, batch_y = batch_X.to(self.device), batch_y.to(self.device)
-                
-                optimizer.zero_grad()
-                
-                # Forward pass
-                outputs = model(batch_X)
-                
-                # Debug print for first batch of first epoch
-                if epoch == 0 and train_loss == 0:
-                    print(f"Batch X device: {batch_X.device}")
-                    print(f"Batch y device: {batch_y.device}")
-                    print(f"Model device: {next(model.parameters()).device}")
-                    print(f"Batch X shape: {batch_X.shape}")
-                    print(f"Batch y shape: {batch_y.shape}")
-                    print(f"Output shape: {outputs.shape}")
-                
-                # Calculate loss
-                loss = criterion(outputs, batch_y)
-                
-                # Backward pass
-                loss.backward()
-                
-                # Gradient clipping to prevent exploding gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                optimizer.step()
-                
-                train_loss += loss.item()
-            
-            # Validation
-            model.eval()
-            val_loss = 0
-            with torch.no_grad():
-                for batch_X, batch_y in val_loader:
-                    batch_X, batch_y = batch_X.to(self.device), batch_y.to(self.device)
-                    outputs = model(batch_X)
-                    val_loss += criterion(outputs, batch_y).item()
-            
-            avg_train_loss = train_loss / len(train_loader)
-            avg_val_loss = val_loss / len(val_loader)
-            
-            train_losses.append(avg_train_loss)
-            val_losses.append(avg_val_loss)
-            
-            scheduler.step(avg_val_loss)
-            
-            epoch_time = time.time() - epoch_start_time
-            
-            if (epoch + 1) % 10 == 0:
-                # Print GPU memory usage if using GPU
-                if torch.cuda.is_available():
-                    memory_allocated = torch.cuda.memory_allocated() / 1e9
-                    memory_reserved = torch.cuda.memory_reserved() / 1e9
-                    print(f'Epoch [{epoch+1}/{epochs}] - Time: {epoch_time:.2f}s - '
-                          f'Train Loss: {avg_train_loss:.4f} - Val Loss: {avg_val_loss:.4f} - '
-                          f'GPU Mem: {memory_allocated:.2f}/{memory_reserved:.2f} GB')
-                else:
-                    print(f'Epoch [{epoch+1}/{epochs}] - Time: {epoch_time:.2f}s - '
-                          f'Train Loss: {avg_train_loss:.4f} - Val Loss: {avg_val_loss:.4f}')
-        
-        total_training_time = time.time() - total_start_time
-        print(f"Total training time: {total_training_time:.2f} seconds")
-        print(f"Average time per epoch: {total_training_time/epochs:.2f} seconds")
-        
-        # Store model
-        self.models[region_name] = {
-            'model': model,
-            'feature_names': feature_names,
-            'train_losses': train_losses,
-            'val_losses': val_losses
-        }
-        
-        # Evaluate on test set
-        print("\nEvaluating on test set...")
-        test_predictions, test_targets = self.evaluate_model(model, test_loader)
-        
-        return model, train_losses, val_losses
+    return np.array(X), np.array(y)
+
+# Prepare data for sequences
+feature_cols = [col for col in selected_features if col != 'pm2_5 (μg/m³)']
+feature_cols.extend(time_features)  # Add time features
+
+print(f"\nTotal features: {len(feature_cols)}")
+print(f"Features: {feature_cols}")
+
+# Create feature matrix and target
+X_data = df_lstm_clean[feature_cols].values
+y_data = df_lstm_clean['pm2_5 (μg/m³)'].values.reshape(-1, 1)
+
+print(f"\nX_data shape: {X_data.shape}")
+print(f"y_data shape: {y_data.shape}")
+
+# Scale features and target separately
+scaler_features = StandardScaler()
+scaler_target = StandardScaler()
+
+# Scale features
+X_scaled = scaler_features.fit_transform(X_data)
+
+# Scale target
+y_scaled = scaler_target.fit_transform(y_data)
+
+# Combine scaled data (for sequence creation)
+scaled_data = np.column_stack([X_scaled, y_scaled])
+
+# Create sequences
+SEQUENCE_LENGTH = 48  # Use 48 hours of history
+FORECAST_HORIZON = 1  # Predict 1 hour ahead
+
+X_sequences, y_sequences = create_sequences_numpy(
+    scaled_data, 
+    sequence_length=SEQUENCE_LENGTH, 
+    forecast_horizon=FORECAST_HORIZON
+)
+
+print(f"\nSequence shape: {X_sequences.shape}")
+print(f"Target shape: {y_sequences.shape}")
+print(f"Number of sequences: {len(X_sequences)}")
+
+# ==================== TRAIN-TEST SPLIT ====================
+# Temporal split for time series
+split_idx = int(len(X_sequences) * 0.8)
+X_train, X_test = X_sequences[:split_idx], X_sequences[split_idx:]
+y_train, y_test = y_sequences[:split_idx], y_sequences[split_idx:]
+
+# Further split for validation
+val_split = int(len(X_train) * 0.8)
+X_train_final, X_val = X_train[:val_split], X_train[val_split:]
+y_train_final, y_val = y_train[:val_split], y_train[val_split:]
+
+print(f"\nTraining set: {X_train_final.shape}")
+print(f"Validation set: {X_val.shape}")
+print(f"Test set: {X_test.shape}")
+
+# ==================== LSTM MODEL ARCHITECTURE ====================
+print("\n" + "="*50)
+print("BUILDING LSTM MODEL")
+print("="*50)
+
+# Model parameters
+INPUT_SHAPE = (SEQUENCE_LENGTH, len(feature_cols))
+N_FEATURES = len(feature_cols)
+
+# Clear any existing TensorFlow session
+keras.backend.clear_session()
+
+# Build LSTM model
+model = keras.Sequential([
+    layers.LSTM(64, 
+                activation='tanh',
+                return_sequences=True,
+                input_shape=INPUT_SHAPE,
+                dropout=0.2,
+                recurrent_dropout=0.2),
     
-    def evaluate_model(self, model, data_loader):
-        """Evaluate model performance"""
-        model.eval()
-        predictions = []
-        targets = []
-        
-        with torch.no_grad():
-            for batch_X, batch_y in data_loader:
-                batch_X = batch_X.to(self.device)
-                outputs = model(batch_X)
-                
-                # Move predictions back to CPU for numpy conversion
-                predictions.extend(outputs.cpu().numpy())
-                targets.extend(batch_y.numpy())
-        
-        predictions = np.array(predictions)
-        targets = np.array(targets)
-        
-        # Inverse transform predictions
-        predictions_2d = predictions.reshape(-1, 2)
-        targets_2d = targets.reshape(-1, 2)
-        
-        predictions_inv = self.scalers['y'].inverse_transform(predictions_2d)
-        targets_inv = self.scalers['y'].inverse_transform(targets_2d)
-        
-        # Reshape back
-        n_samples = predictions.shape[0]
-        predictions_inv = predictions_inv.reshape(n_samples, self.forecast_horizon, 2)
-        targets_inv = targets_inv.reshape(n_samples, self.forecast_horizon, 2)
-        
-        # Calculate metrics for first hour prediction
-        pm25_pred_first = predictions_inv[:, 0, 0]
-        pm25_true_first = targets_inv[:, 0, 0]
-        pm10_pred_first = predictions_inv[:, 0, 1]
-        pm10_true_first = targets_inv[:, 0, 1]
-        
-        print(f"PM2.5 RMSE: {np.sqrt(mean_squared_error(pm25_true_first, pm25_pred_first)):.2f}")
-        print(f"PM2.5 MAE: {mean_absolute_error(pm25_true_first, pm25_pred_first):.2f}")
-        print(f"PM10 RMSE: {np.sqrt(mean_squared_error(pm10_true_first, pm10_pred_first)):.2f}")
-        print(f"PM10 MAE: {mean_absolute_error(pm10_true_first, pm10_pred_first):.2f}")
-        
-        return predictions, targets
+    layers.LSTM(32,
+                activation='tanh',
+                dropout=0.2,
+                recurrent_dropout=0.2),
     
-    def predict_future(self, df, region_name, steps_ahead=720):
-        """Predict future values for a region"""
-        if region_name not in self.models:
-            raise ValueError(f"No model trained for region: {region_name}")
-        
-        model = self.models[region_name]['model']
-        model.eval()
-        
-        # Prepare the last lookback hours from data
-        df_processed = self.prepare_features(df)
-        feature_cols = self.models[region_name]['feature_names']
-        
-        # Get the last lookback hours
-        last_sequence = df_processed[feature_cols].iloc[-self.lookback:].values
-        last_sequence_scaled = self.scalers['X'].transform(last_sequence)
-        
-        # Reshape for LSTM (1, lookback, n_features) and move to GPU
-        input_seq = torch.FloatTensor(last_sequence_scaled).unsqueeze(0).to(self.device)
-        
-        # Make prediction
-        with torch.no_grad():
-            prediction_scaled = model(input_seq)
-        
-        # Move prediction back to CPU
-        prediction_scaled_np = prediction_scaled.cpu().numpy().reshape(-1, 2)
-        prediction = self.scalers['y'].inverse_transform(prediction_scaled_np)
-        
-        # Reshape to (steps_ahead, 2)
-        prediction = prediction.reshape(steps_ahead, 2)
-        
-        # Create future timestamps
-        last_timestamp = df_processed.index[-1]
-        future_timestamps = pd.date_range(
-            start=last_timestamp + pd.Timedelta(hours=1),
-            periods=steps_ahead,
-            freq='H'
-        )
-        
-        # Create result DataFrame
-        result_df = pd.DataFrame({
-            'timestamp': future_timestamps,
-            'pm2_5_pred': prediction[:, 0],
-            'pm10_pred': prediction[:, 1]
-        })
-        
-        return result_df
+    layers.Dense(16, activation='relu'),
+    layers.Dropout(0.2),
     
-    def plot_predictions(self, predictions_df, actual_df=None, region_name=""):
-        """Plot predictions vs actuals with fixed datetime handling"""
-        fig, axes = plt.subplots(2, 1, figsize=(15, 10))
+    layers.Dense(1)
+])
+
+# Compile model
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=0.001),
+    loss='mse',
+    metrics=['mae', 'mse']
+)
+
+print("\nModel Summary:")
+model.summary()
+
+# ==================== CALLBACKS ====================
+# Define callbacks for training
+callbacks_list = [
+    # Early stopping to prevent overfitting
+    callbacks.EarlyStopping(
+        monitor='val_loss',
+        patience=20,
+        restore_best_weights=True,
+        verbose=1
+    ),
+    
+    # Reduce learning rate when plateau
+    callbacks.ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=10,
+        min_lr=0.00001,
+        verbose=1
+    ),
+    
+    # Model checkpoint
+    callbacks.ModelCheckpoint(
+        'best_lstm_model.keras',
+        monitor='val_loss',
+        save_best_only=True,
+        verbose=1
+    )
+]
+
+# ==================== TRAIN MODEL ====================
+print("\n" + "="*50)
+print("TRAINING LSTM MODEL")
+print("="*50)
+
+# Train the model
+history = model.fit(
+    X_train_final, y_train_final,
+    epochs=20,
+    batch_size=64,
+    validation_data=(X_val, y_val),
+    callbacks=callbacks_list,
+    verbose=1
+)
+
+# ==================== EVALUATION ====================
+# Load best model
+try:
+    model = keras.models.load_model('best_lstm_model.keras')
+    print("Loaded best model from checkpoint")
+except:
+    print("Using final trained model")
+
+# Make predictions
+print("\nMaking predictions...")
+y_pred_train = model.predict(X_train_final, verbose=0).flatten()
+y_pred_val = model.predict(X_val, verbose=0).flatten()
+y_pred_test = model.predict(X_test, verbose=0).flatten()
+
+# Inverse transform predictions and actual values
+y_train_actual = scaler_target.inverse_transform(y_train_final.reshape(-1, 1)).flatten()
+y_train_pred = scaler_target.inverse_transform(y_pred_train.reshape(-1, 1)).flatten()
+
+y_val_actual = scaler_target.inverse_transform(y_val.reshape(-1, 1)).flatten()
+y_val_pred = scaler_target.inverse_transform(y_pred_val.reshape(-1, 1)).flatten()
+
+y_test_actual = scaler_target.inverse_transform(y_test.reshape(-1, 1)).flatten()
+y_test_pred = scaler_target.inverse_transform(y_pred_test.reshape(-1, 1)).flatten()
+
+# Calculate metrics
+def calculate_lstm_metrics(y_true, y_pred, dataset_name):
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2 = r2_score(y_true, y_pred)
+    mape = np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), 1))) * 100
+    
+    print(f"\n{dataset_name} Metrics:")
+    print(f"  MAE: {mae:.2f} μg/m³")
+    print(f"  RMSE: {rmse:.2f} μg/m³")
+    print(f"  R² Score: {r2:.4f}")
+    print(f"  MAPE: {mape:.2f}%")
+    
+    return mae, rmse, r2
+
+print("\n" + "="*50)
+print("MODEL PERFORMANCE")
+print("="*50)
+
+train_metrics = calculate_lstm_metrics(y_train_actual, y_train_pred, "Training")
+val_metrics = calculate_lstm_metrics(y_val_actual, y_val_pred, "Validation")
+test_metrics = calculate_lstm_metrics(y_test_actual, y_test_pred, "Test")
+
+# ==================== VISUALIZATION ====================
+plt.style.use('seaborn-v0_8-darkgrid')
+fig = plt.figure(figsize=(20, 15))
+
+# Plot 1: Training History
+ax1 = plt.subplot(3, 3, 1)
+if 'loss' in history.history:
+    ax1.plot(history.history['loss'], label='Training Loss', linewidth=2)
+    ax1.plot(history.history['val_loss'], label='Validation Loss', linewidth=2)
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss (MSE)')
+    ax1.set_title('Training History')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+# Plot 2: Test Set Predictions vs Actual (Scatter)
+ax2 = plt.subplot(3, 3, 2)
+ax2.scatter(y_test_actual, y_test_pred, alpha=0.5, s=20, c='blue')
+ax2.plot([y_test_actual.min(), y_test_actual.max()], 
+         [y_test_actual.min(), y_test_actual.max()], 
+         'r--', linewidth=2)
+ax2.set_xlabel('Actual PM2.5 (μg/m³)')
+ax2.set_ylabel('Predicted PM2.5 (μg/m³)')
+ax2.set_title(f'Test Set: Predictions vs Actual (R²={test_metrics[2]:.3f})')
+ax2.grid(True, alpha=0.3)
+
+# Plot 3: Time Series Predictions (first 100 hours)
+ax3 = plt.subplot(3, 3, 3)
+hours_to_plot = min(100, len(y_test_actual))
+ax3.plot(range(hours_to_plot), y_test_actual[:hours_to_plot], 
+         'b-', label='Actual', linewidth=2, alpha=0.8)
+ax3.plot(range(hours_to_plot), y_test_pred[:hours_to_plot], 
+         'r-', label='Predicted', linewidth=2, alpha=0.8)
+ax3.set_xlabel('Hour')
+ax3.set_ylabel('PM2.5 (μg/m³)')
+ax3.set_title(f'First {hours_to_plot} Hours of Test Set')
+ax3.legend()
+ax3.grid(True, alpha=0.3)
+
+# Plot 4: Error Distribution
+ax4 = plt.subplot(3, 3, 4)
+errors = y_test_actual - y_test_pred
+ax4.hist(errors, bins=50, edgecolor='black', alpha=0.7, color='skyblue')
+ax4.axvline(x=0, color='red', linestyle='--', linewidth=2)
+ax4.set_xlabel('Prediction Error (μg/m³)')
+ax4.set_ylabel('Frequency')
+ax4.set_title(f'Error Distribution\nMean: {errors.mean():.2f}, Std: {errors.std():.2f}')
+ax4.grid(True, alpha=0.3)
+
+# Plot 5: Residual Plot
+ax5 = plt.subplot(3, 3, 5)
+residuals = y_test_actual - y_test_pred
+ax5.scatter(y_test_pred, residuals, alpha=0.5, s=20, c='green')
+ax5.axhline(y=0, color='red', linestyle='--', linewidth=2)
+ax5.set_xlabel('Predicted PM2.5 (μg/m³)')
+ax5.set_ylabel('Residuals')
+ax5.set_title('Residual Plot')
+ax5.grid(True, alpha=0.3)
+
+# Plot 6: Learning Rate History
+ax6 = plt.subplot(3, 3, 6)
+if 'lr' in history.history:
+    ax6.plot(history.history['lr'], linewidth=2)
+    ax6.set_xlabel('Epoch')
+    ax6.set_ylabel('Learning Rate')
+    ax6.set_title('Learning Rate Schedule')
+    ax6.set_yscale('log')
+    ax6.grid(True, alpha=0.3)
+
+# Plot 7: MAE during training
+ax7 = plt.subplot(3, 3, 7)
+if 'mae' in history.history:
+    ax7.plot(history.history['mae'], label='Training MAE', linewidth=2)
+    ax7.plot(history.history['val_mae'], label='Validation MAE', linewidth=2)
+    ax7.set_xlabel('Epoch')
+    ax7.set_ylabel('MAE')
+    ax7.set_title('MAE during Training')
+    ax7.legend()
+    ax7.grid(True, alpha=0.3)
+
+# Plot 8: Actual vs Predicted Distribution
+ax8 = plt.subplot(3, 3, 8)
+ax8.hist(y_test_actual, bins=30, alpha=0.5, label='Actual', edgecolor='black', density=True)
+ax8.hist(y_test_pred, bins=30, alpha=0.5, label='Predicted', edgecolor='black', density=True)
+ax8.set_xlabel('PM2.5 (μg/m³)')
+ax8.set_ylabel('Density')
+ax8.set_title('Distribution: Actual vs Predicted')
+ax8.legend()
+ax8.grid(True, alpha=0.3)
+
+# Plot 9: Rolling Error
+ax9 = plt.subplot(3, 3, 9)
+if len(errors) > 24:
+    rolling_error = pd.Series(errors).rolling(window=24).mean()
+    ax9.plot(rolling_error, linewidth=2, color='purple')
+    ax9.axhline(y=0, color='red', linestyle='--', linewidth=2)
+    ax9.set_xlabel('Hour')
+    ax9.set_ylabel('Rolling MAE (24h window)')
+    ax9.set_title('Rolling Prediction Error')
+    ax9.grid(True, alpha=0.3)
+else:
+    ax9.text(0.5, 0.5, 'Insufficient data\nfor rolling error',
+             horizontalalignment='center', verticalalignment='center',
+             transform=ax9.transAxes, fontsize=12)
+    ax9.set_title('Rolling Prediction Error')
+
+plt.tight_layout()
+plt.savefig('lstm_results.png', dpi=100, bbox_inches='tight')
+plt.show()
+
+# ==================== FORECAST FUNCTION ====================
+def forecast_pm25_lstm(model, scaler_features, scaler_target, recent_data, 
+                       feature_cols, sequence_length=SEQUENCE_LENGTH):
+    """
+    Forecast PM2.5 using LSTM model
+    
+    Args:
+        model: Trained LSTM model
+        scaler_features: Fitted scaler for features
+        scaler_target: Fitted scaler for target
+        recent_data: Array of recent data (shape: sequence_length x n_features)
+        feature_cols: List of feature column names
+        sequence_length: Length of input sequence
+    
+    Returns:
+        Predicted PM2.5 value (unscaled)
+    """
+    # Ensure recent_data has correct shape
+    if recent_data.shape[0] < sequence_length:
+        raise ValueError(f"Need at least {sequence_length} hours of data")
+    
+    # Use only the most recent sequence_length hours
+    recent_data = recent_data[-sequence_length:]
+    
+    # Scale the features
+    scaled_features = scaler_features.transform(recent_data)
+    
+    # Reshape for LSTM (1 sample, sequence_length timesteps, n_features)
+    input_seq = scaled_features.reshape(1, sequence_length, len(feature_cols))
+    
+    # Make prediction
+    scaled_prediction = model.predict(input_seq, verbose=0)[0][0]
+    
+    # Inverse transform the prediction
+    prediction = scaler_target.inverse_transform([[scaled_prediction]])[0][0]
+    
+    return prediction
+
+# ==================== MULTI-STEP FORECASTING ====================
+def multi_step_forecast_lstm(model, initial_sequence, steps_ahead=168, 
+                            scaler_features=scaler_features, 
+                            scaler_target=scaler_target,
+                            feature_cols=feature_cols,
+                            df_history=None):
+    """
+    Make multi-step forecasts using iterative prediction
+    
+    Args:
+        model: Trained LSTM model
+        initial_sequence: Initial sequence of features
+        steps_ahead: Number of steps to forecast
+        scaler_features, scaler_target: Scalers
+        feature_cols: Feature columns
+        df_history: Historical dataframe for feature updates
+    
+    Returns:
+        Array of forecasts, forecast dates
+    """
+    forecasts = []
+    forecast_dates = []
+    
+    current_seq = initial_sequence.copy()
+    last_date = df_lstm_clean['time'].iloc[-1]
+    
+    for step in range(steps_ahead):
+        forecast_date = last_date + timedelta(hours=step+1)
+        forecast_dates.append(forecast_date)
         
-        # Convert predictions_df timestamp to datetime if it's not already
-        if not pd.api.types.is_datetime64_any_dtype(predictions_df['timestamp']):
-            predictions_df['timestamp'] = pd.to_datetime(predictions_df['timestamp'])
+        # Get prediction for next step
+        input_seq = current_seq.reshape(1, SEQUENCE_LENGTH, len(feature_cols))
+        scaled_pred = model.predict(input_seq, verbose=0)[0][0]
+        pred_value = scaler_target.inverse_transform([[scaled_pred]])[0][0]
+        forecasts.append(pred_value)
         
-        # PM2.5 plot
-        axes[0].plot(predictions_df['timestamp'], predictions_df['pm2_5_pred'], 
-                    label='Predicted PM2.5', color='blue', linewidth=2)
+        # For multi-step forecasting, we need to create new input
+        # This is a simplified approach - in reality, you need future feature values
         
-        if actual_df is not None:
-            # Ensure actual_df['time'] is datetime
-            if 'time' in actual_df.columns:
-                if not pd.api.types.is_datetime64_any_dtype(actual_df['time']):
-                    actual_df['time'] = pd.to_datetime(actual_df['time'])
-                
-                # Filter actual data to match prediction timeframe
-                mask = (actual_df['time'] >= predictions_df['timestamp'].iloc[0]) & \
-                    (actual_df['time'] <= predictions_df['timestamp'].iloc[-1])
-                actual_filtered = actual_df[mask]
-                
-                if len(actual_filtered) > 0:
-                    axes[0].plot(actual_filtered['time'], actual_filtered['pm2_5 (μg/m³)'], 
-                                label='Actual PM2.5', color='red', alpha=0.7, linewidth=1)
-        
-        axes[0].set_ylabel('PM2.5 (μg/m³)')
-        axes[0].set_title(f'{region_name} - PM2.5 Predictions (Next {len(predictions_df)} hours)')
-        axes[0].legend()
-        axes[0].grid(True, alpha=0.3)
-        
-        # Format x-axis for PM2.5 plot
-        if len(predictions_df) > 24:
-            # If more than 1 day, show date and time
-            axes[0].xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%m-%d %H:%M'))
+        # Create a new feature row for the next time step
+        # Use the last row's features as a starting point
+        if df_history is not None and step < len(df_history) - SEQUENCE_LENGTH:
+            # Get actual future features if available (for testing)
+            new_features = df_history[feature_cols].iloc[-SEQUENCE_LENGTH + step + 1].values
         else:
-            # If less than 1 day, show only time
-            axes[0].xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
+            # Create synthetic features (simplified)
+            # In practice, you would need weather forecasts here
+            new_features = current_seq[-1].copy()  # Use last known features
+            
+            # Update time features
+            hour = forecast_date.hour
+            day_of_week = forecast_date.dayofweek
+            month = forecast_date.month
+            
+            # Find time feature indices
+            time_feature_indices = {}
+            for idx, col in enumerate(feature_cols):
+                if 'hour_sin' in col:
+                    time_feature_indices['hour_sin'] = idx
+                elif 'hour_cos' in col:
+                    time_feature_indices['hour_cos'] = idx
+                elif 'day_sin' in col:
+                    time_feature_indices['day_sin'] = idx
+                elif 'day_cos' in col:
+                    time_feature_indices['day_cos'] = idx
+                elif 'month_sin' in col:
+                    time_feature_indices['month_sin'] = idx
+                elif 'month_cos' in col:
+                    time_feature_indices['month_cos'] = idx
+            
+            # Update cyclical features
+            if 'hour_sin' in time_feature_indices:
+                new_features[time_feature_indices['hour_sin']] = np.sin(2 * np.pi * hour / 24)
+            if 'hour_cos' in time_feature_indices:
+                new_features[time_feature_indices['hour_cos']] = np.cos(2 * np.pi * hour / 24)
+            if 'day_sin' in time_feature_indices:
+                new_features[time_feature_indices['day_sin']] = np.sin(2 * np.pi * day_of_week / 7)
+            if 'day_cos' in time_feature_indices:
+                new_features[time_feature_indices['day_cos']] = np.cos(2 * np.pi * day_of_week / 7)
+            if 'month_sin' in time_feature_indices:
+                new_features[time_feature_indices['month_sin']] = np.sin(2 * np.pi * month / 12)
+            if 'month_cos' in time_feature_indices:
+                new_features[time_feature_indices['month_cos']] = np.cos(2 * np.pi * month / 12)
         
-        # PM10 plot
-        axes[1].plot(predictions_df['timestamp'], predictions_df['pm10_pred'], 
-                    label='Predicted PM10', color='green', linewidth=2)
-        
-        if actual_df is not None and 'time' in actual_df.columns:
-            if len(actual_filtered) > 0:
-                axes[1].plot(actual_filtered['time'], actual_filtered['pm10 (μg/m³)'], 
-                            label='Actual PM10', color='orange', alpha=0.7, linewidth=1)
-        
-        axes[1].set_ylabel('PM10 (μg/m³)')
-        axes[1].set_xlabel('Timestamp')
-        axes[1].set_title(f'{region_name} - PM10 Predictions (Next {len(predictions_df)} hours)')
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
-        
-        # Format x-axis for PM10 plot
-        if len(predictions_df) > 24:
-            axes[1].xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%m-%d %H:%M'))
-        else:
-            axes[1].xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%H:%M'))
-        
-        # Rotate x-axis labels for better readability
-        plt.setp(axes[1].xaxis.get_majorticklabels(), rotation=45, ha='right')
-        
-        plt.tight_layout()
-        plt.savefig(f'predictions_{region_name}.png', dpi=300, bbox_inches='tight')
-        plt.show()
+        # Update sequence: remove oldest, add new features
+        current_seq = np.vstack([current_seq[1:], new_features.reshape(1, -1)])
     
-    def save_model(self, region_name, path):
-        """Save trained model"""
-        if region_name in self.models:
-            torch.save({
-                'model_state_dict': self.models[region_name]['model'].state_dict(),
-                'feature_names': self.models[region_name]['feature_names'],
-                'scalers': self.scalers,
-                'lookback': self.lookback,
-                'forecast_horizon': self.forecast_horizon
-            }, path)
-            print(f"Model saved to {path}")
-    
-    def load_model(self, region_name, path):
-        """Load trained model"""
-        checkpoint = torch.load(path, map_location=self.device)
-        
-        # Recreate model
-        input_size = len(checkpoint['feature_names'])
-        model = LSTMModel(
-            input_size=input_size,
-            hidden_size=128,
-            num_layers=2,
-            output_steps=checkpoint['forecast_horizon'],
-            dropout=0.3
-        ).to(self.device)
-        
-        model.load_state_dict(checkpoint['model_state_dict'])
-        
-        self.models[region_name] = {
-            'model': model,
-            'feature_names': checkpoint['feature_names']
-        }
-        self.scalers = checkpoint['scalers']
-        self.lookback = checkpoint['lookback']
-        self.forecast_horizon = checkpoint['forecast_horizon']
-        
-        print(f"Model loaded from {path}")
+    return np.array(forecasts), np.array(forecast_dates)
 
-# Main execution with GPU optimization
-if __name__ == "__main__":
-    # Load your data
-    df = pd.read_csv('final_training_data_all_regions.csv')
-    
-    print("="*60)
-    print("GPU ACCELERATED AIR QUALITY PREDICTION")
-    print("="*60)
-    print(f"Device: {device}")
-    
-    if torch.cuda.is_available():
-        print("✓ GPU acceleration enabled")
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA capability: {torch.cuda.get_device_capability()}")
-    else:
-        print("✗ GPU not available, using CPU")
-        print("Note: Training will be slower on CPU")
-    
-    # Start with smaller parameters for testing
-    print("\nStarting with test configuration...")
-    predictor = AirQualityPredictor(
-        lookback=24,    # Reduced for faster testing
-        forecast_horizon=24  # Reduced for faster testing
+# ==================== GENERATE WEEKLY FORECAST ====================
+print("\n" + "="*50)
+print("GENERATING WEEKLY FORECAST")
+print("="*50)
+
+# Get the last SEQUENCE_LENGTH hours of data
+last_sequence = X_scaled[-SEQUENCE_LENGTH:]
+
+# Generate 1-week forecast
+forecast_horizon = 168  # 1 week = 168 hours
+try:
+    lstm_forecasts, lstm_forecast_dates = multi_step_forecast_lstm(
+        model=model,
+        initial_sequence=last_sequence,
+        steps_ahead=forecast_horizon,
+        scaler_features=scaler_features,
+        scaler_target=scaler_target,
+        feature_cols=feature_cols,
+        df_history=df_lstm_clean
     )
     
-    # Test with first region
-    regions = df['region'].unique()
+    print(f"Generated LSTM forecast for {len(lstm_forecasts)} hours")
+    print(f"Forecast period: {lstm_forecast_dates[0]} to {lstm_forecast_dates[-1]}")
+    print(f"Forecast range: {lstm_forecasts.min():.1f} to {lstm_forecasts.max():.1f} μg/m³")
+    print(f"Average forecast: {lstm_forecasts.mean():.1f} μg/m³")
+    print(f"Standard deviation: {lstm_forecasts.std():.1f} μg/m³")
     
-    for region in regions[:1]:  # Only process first region for testing
-        print(f"\n{'='*50}")
-        print(f"Processing region: {region}")
-        print(f"{'='*50}")
-        
-        # Filter data for region
-        region_data = df[df['region'] == region].copy()
-        
-        # Check data size
-        min_samples_needed = predictor.lookback + predictor.forecast_horizon + 100
-        if len(region_data) < min_samples_needed:
-            print(f"Warning: Insufficient data for {region}")
-            print(f"Need at least {min_samples_needed} samples, have {len(region_data)}")
-            continue
-        
-        print(f"Data points: {len(region_data)}")
-        
-        # Split data
-        split_idx = int(0.8 * len(region_data))
-        train_data = region_data.iloc[:split_idx]
-        test_data = region_data.iloc[split_idx:]
-        
-        print(f"Training samples: {len(train_data)}")
-        print(f"Testing samples: {len(test_data)}")
-        
-        # Train model with GPU acceleration
-        model, train_loss, val_loss = predictor.train(
-            train_data, 
-            region_name=region,
-            epochs=30,  # Reduced epochs for testing
-            batch_size=32,
-            learning_rate=0.001
-        )
-        
-        # Make predictions
-        print("\nMaking predictions...")
-        future_predictions = predictor.predict_future(
-            train_data, 
-            region_name=region,
-            steps_ahead=min(168, predictor.forecast_horizon)  # Predict up to 1 week
-        )
-        
-        # Plot predictions
-        predictor.plot_predictions(
-            future_predictions,
-            actual_df=test_data if len(test_data) > 0 else None,
-            region_name=region
-        )
-        
-        # Save model
-        predictor.save_model(region, f'model_{region}.pth')
-        
-        print(f"\nCompleted processing for {region}")
-        break  # Only process first region for testing
+    # Create forecast visualization
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
     
-    print("\n" + "="*60)
-    print("TRAINING COMPLETE")
-    print("="*60)
+    # Plot 1: Historical + Forecast
+    historical_days = 14
+    historical_hours = historical_days * 24
+    hist_start_idx = max(0, len(df_lstm_clean) - historical_hours)
+    
+    hist_dates = df_lstm_clean['time'].iloc[hist_start_idx:]
+    hist_values = df_lstm_clean['pm2_5 (μg/m³)'].iloc[hist_start_idx:]
+    
+    ax1.plot(hist_dates, hist_values, 'b-', linewidth=2, label='Historical PM2.5', alpha=0.8)
+    ax1.plot(lstm_forecast_dates, lstm_forecasts, 'r-', linewidth=3, label='LSTM 7-Day Forecast', alpha=0.9)
+    
+    # Add confidence interval
+    confidence_level = test_metrics[1]  # Use test RMSE
+    ax1.fill_between(lstm_forecast_dates, 
+                      lstm_forecasts - confidence_level, 
+                      lstm_forecasts + confidence_level, 
+                      color='red', alpha=0.2, label='Confidence Interval')
+    
+    ax1.axvline(x=lstm_forecast_dates[0], color='black', linestyle='--', linewidth=1.5)
+    ax1.text(lstm_forecast_dates[0], ax1.get_ylim()[1]*0.95, 'Forecast Start', 
+             rotation=90, verticalalignment='top', fontsize=10)
+    
+    ax1.set_xlabel('Date')
+    ax1.set_ylabel('PM2.5 (μg/m³)')
+    ax1.set_title('LSTM: PM2.5 Historical Data and 7-Day Forecast', fontsize=14, fontweight='bold')
+    ax1.legend(loc='upper left')
+    ax1.grid(True, alpha=0.3)
+    
+    # Format x-axis dates
+    ax1.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%b %d'))
+    ax1.xaxis.set_major_locator(plt.matplotlib.dates.DayLocator(interval=2))
+    plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45)
+    
+    # Plot 2: Forecast details
+    ax2.bar(range(len(lstm_forecasts)), lstm_forecasts, alpha=0.7, color='skyblue')
+    ax2.set_xlabel('Hours into Future')
+    ax2.set_ylabel('PM2.5 (μg/m³)')
+    ax2.set_title('LSTM: Hourly Forecast for Next 7 Days')
+    ax2.grid(True, alpha=0.3, axis='y')
+    
+    # Add horizontal lines for health guidelines
+    ax2.axhline(y=12, color='green', linestyle='--', alpha=0.5, label='Good (12 μg/m³)')
+    ax2.axhline(y=35, color='orange', linestyle='--', alpha=0.5, label='Moderate (35 μg/m³)')
+    ax2.legend()
+    
+    plt.tight_layout()
+    plt.savefig('lstm_weekly_forecast.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    # Save forecast to CSV
+    forecast_df = pd.DataFrame({
+        'timestamp': lstm_forecast_dates,
+        'pm2_5_forecast': lstm_forecasts,
+        'pm2_5_lower_bound': lstm_forecasts - confidence_level,
+        'pm2_5_upper_bound': lstm_forecasts + confidence_level
+    })
+    
+    forecast_df.to_csv('lstm_pm25_7day_forecast.csv', index=False)
+    print(f"\nLSTM forecast saved to: lstm_pm25_7day_forecast.csv")
+    
+except Exception as e:
+    print(f"Error generating LSTM forecast: {e}")
+    print("Creating simple forecast for visualization...")
+    
+    # Create a simple forecast based on historical patterns
+    last_value = df_lstm_clean['pm2_5 (μg/m³)'].iloc[-1]
+    lstm_forecasts = np.full(168, last_value)  # Constant forecast
+    lstm_forecast_dates = [df_lstm_clean['time'].iloc[-1] + timedelta(hours=i+1) for i in range(168)]
+
+# ==================== SAVE MODEL AND ARTIFACTS ====================
+print("\n" + "="*50)
+print("SAVING MODEL AND ARTIFACTS")
+print("="*50)
+
+# Save the model
+model.save('lstm_pm25_model.keras')
+
+# Save scalers and feature list
+import joblib
+joblib.dump(scaler_features, 'lstm_scaler_features.pkl')
+joblib.dump(scaler_target, 'lstm_scaler_target.pkl')
+joblib.dump(feature_cols, 'lstm_feature_cols.pkl')
+
+print("Files saved:")
+print("1. lstm_pm25_model.keras - LSTM model")
+print("2. lstm_scaler_features.pkl - Feature scaler")
+print("3. lstm_scaler_target.pkl - Target scaler")
+print("4. lstm_feature_cols.pkl - Feature columns")
+print("5. lstm_results.png - Model performance plots")
+print("6. lstm_weekly_forecast.png - Weekly forecast visualization")
+if 'forecast_df' in locals():
+    print("7. lstm_pm25_7day_forecast.csv - Forecast data")
+
+print("\n" + "="*50)
+print("PERFORMANCE SUMMARY")
+print("="*50)
+print(f"Sequence Length: {SEQUENCE_LENGTH} hours")
+print(f"Forecast Horizon: {FORECAST_HORIZON} hour(s)")
+print(f"Test R² Score: {test_metrics[2]:.4f}")
+print(f"Test MAE: {test_metrics[0]:.2f} μg/m³")
+print(f"Test RMSE: {test_metrics[1]:.2f} μg/m³")
+print("="*50)
