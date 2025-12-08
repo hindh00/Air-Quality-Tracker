@@ -9,7 +9,19 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime, timedelta
 import warnings
+import os
+import pickle
+import json
+
 warnings.filterwarnings('ignore')
+
+# ==================== CREATE MODEL DIRECTORY ====================
+MODEL_DIR = "LSTM_model"
+if not os.path.exists(MODEL_DIR):
+    os.makedirs(MODEL_DIR)
+    print(f"Created directory: {MODEL_DIR}")
+else:
+    print(f"Using existing directory: {MODEL_DIR}")
 
 # Set random seeds for reproducibility
 np.random.seed(42)
@@ -129,7 +141,7 @@ y_scaled = scaler_target.fit_transform(y_data)
 scaled_data = np.column_stack([X_scaled, y_scaled])
 
 # Create sequences
-SEQUENCE_LENGTH = 48  # Use 48 hours of history
+SEQUENCE_LENGTH = 24  # Use 24 hours of history
 FORECAST_HORIZON = 1  # Predict 1 hour ahead
 
 X_sequences, y_sequences = create_sequences_numpy(
@@ -201,6 +213,7 @@ model.summary()
 
 # ==================== CALLBACKS ====================
 # Define callbacks for training
+model_checkpoint_path = os.path.join(MODEL_DIR, 'best_lstm_model.keras')
 callbacks_list = [
     # Early stopping to prevent overfitting
     callbacks.EarlyStopping(
@@ -221,7 +234,7 @@ callbacks_list = [
     
     # Model checkpoint
     callbacks.ModelCheckpoint(
-        'best_lstm_model.keras',
+        model_checkpoint_path,
         monitor='val_loss',
         save_best_only=True,
         verbose=1
@@ -236,7 +249,7 @@ print("="*50)
 # Train the model
 history = model.fit(
     X_train_final, y_train_final,
-    epochs=20,
+    epochs=30,
     batch_size=64,
     validation_data=(X_val, y_val),
     callbacks=callbacks_list,
@@ -246,7 +259,7 @@ history = model.fit(
 # ==================== EVALUATION ====================
 # Load best model
 try:
-    model = keras.models.load_model('best_lstm_model.keras')
+    model = keras.models.load_model(model_checkpoint_path)
     print("Loaded best model from checkpoint")
 except:
     print("Using final trained model")
@@ -280,7 +293,12 @@ def calculate_lstm_metrics(y_true, y_pred, dataset_name):
     print(f"  R² Score: {r2:.4f}")
     print(f"  MAPE: {mape:.2f}%")
     
-    return mae, rmse, r2
+    return {
+        'mae': float(mae),
+        'rmse': float(rmse),
+        'r2': float(r2),
+        'mape': float(mape)
+    }
 
 print("\n" + "="*50)
 print("MODEL PERFORMANCE")
@@ -313,7 +331,7 @@ ax2.plot([y_test_actual.min(), y_test_actual.max()],
          'r--', linewidth=2)
 ax2.set_xlabel('Actual PM2.5 (μg/m³)')
 ax2.set_ylabel('Predicted PM2.5 (μg/m³)')
-ax2.set_title(f'Test Set: Predictions vs Actual (R²={test_metrics[2]:.3f})')
+ax2.set_title(f'Test Set: Predictions vs Actual (R²={test_metrics["r2"]:.3f})')
 ax2.grid(True, alpha=0.3)
 
 # Plot 3: Time Series Predictions (first 100 hours)
@@ -397,7 +415,8 @@ else:
     ax9.set_title('Rolling Prediction Error')
 
 plt.tight_layout()
-plt.savefig('lstm_results.png', dpi=100, bbox_inches='tight')
+results_plot_path = os.path.join(MODEL_DIR, 'lstm_results.png')
+plt.savefig(results_plot_path, dpi=100, bbox_inches='tight')
 plt.show()
 
 # ==================== FORECAST FUNCTION ====================
@@ -569,7 +588,7 @@ try:
     ax1.plot(lstm_forecast_dates, lstm_forecasts, 'r-', linewidth=3, label='LSTM 7-Day Forecast', alpha=0.9)
     
     # Add confidence interval
-    confidence_level = test_metrics[1]  # Use test RMSE
+    confidence_level = test_metrics['rmse']  # Use test RMSE
     ax1.fill_between(lstm_forecast_dates, 
                       lstm_forecasts - confidence_level, 
                       lstm_forecasts + confidence_level, 
@@ -603,7 +622,8 @@ try:
     ax2.legend()
     
     plt.tight_layout()
-    plt.savefig('lstm_weekly_forecast.png', dpi=150, bbox_inches='tight')
+    forecast_plot_path = os.path.join(MODEL_DIR, 'lstm_weekly_forecast.png')
+    plt.savefig(forecast_plot_path, dpi=150, bbox_inches='tight')
     plt.show()
     
     # Save forecast to CSV
@@ -614,8 +634,9 @@ try:
         'pm2_5_upper_bound': lstm_forecasts + confidence_level
     })
     
-    forecast_df.to_csv('lstm_pm25_7day_forecast.csv', index=False)
-    print(f"\nLSTM forecast saved to: lstm_pm25_7day_forecast.csv")
+    forecast_csv_path = os.path.join(MODEL_DIR, 'lstm_pm25_7day_forecast.csv')
+    forecast_df.to_csv(forecast_csv_path, index=False)
+    print(f"\nLSTM forecast saved to: {forecast_csv_path}")
     
 except Exception as e:
     print(f"Error generating LSTM forecast: {e}")
@@ -626,36 +647,110 @@ except Exception as e:
     lstm_forecasts = np.full(168, last_value)  # Constant forecast
     lstm_forecast_dates = [df_lstm_clean['time'].iloc[-1] + timedelta(hours=i+1) for i in range(168)]
 
-# ==================== SAVE MODEL AND ARTIFACTS ====================
+# ==================== CREATE CONSOLIDATED ARTIFACTS FILE ====================
 print("\n" + "="*50)
 print("SAVING MODEL AND ARTIFACTS")
 print("="*50)
 
-# Save the model
-model.save('lstm_pm25_model.keras')
+# Create a comprehensive dictionary with all model artifacts
+model_artifacts = {
+    'model': model,
+    'scaler_features': scaler_features,
+    'scaler_target': scaler_target,
+    'feature_cols': feature_cols,
+    'model_params': {
+        'sequence_length': SEQUENCE_LENGTH,
+        'forecast_horizon': FORECAST_HORIZON,
+        'input_shape': INPUT_SHAPE,
+        'n_features': N_FEATURES
+    },
+    'test_metrics': test_metrics,
+    'training_metrics': train_metrics,
+    'validation_metrics': val_metrics,
+    'model_summary': model.summary(),
+    'training_history': history.history if 'history' in locals() else None,
+    'forecast_functions': {
+        'forecast_pm25_lstm': forecast_pm25_lstm,
+        'multi_step_forecast_lstm': multi_step_forecast_lstm
+    },
+    'metadata': {
+        'creation_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'data_source': 'final_training_data_all_regions.csv',
+        'region': 'doha' if 'region' in df.columns else 'all',
+        'target_column': 'pm2_5 (μg/m³)'
+    }
+}
 
-# Save scalers and feature list
-import joblib
-joblib.dump(scaler_features, 'lstm_scaler_features.pkl')
-joblib.dump(scaler_target, 'lstm_scaler_target.pkl')
-joblib.dump(feature_cols, 'lstm_feature_cols.pkl')
+# Save consolidated artifacts as a single pickle file
+consolidated_path = os.path.join(MODEL_DIR, 'lstm_model_artifacts.pkl')
+with open(consolidated_path, 'wb') as f:
+    pickle.dump(model_artifacts, f)
+print(f"✓ Consolidated artifacts saved to: {consolidated_path}")
 
-print("Files saved:")
-print("1. lstm_pm25_model.keras - LSTM model")
-print("2. lstm_scaler_features.pkl - Feature scaler")
-print("3. lstm_scaler_target.pkl - Target scaler")
-print("4. lstm_feature_cols.pkl - Feature columns")
-print("5. lstm_results.png - Model performance plots")
-print("6. lstm_weekly_forecast.png - Weekly forecast visualization")
+# Save metadata and metrics as JSON
+metadata = {
+    'model_params': model_artifacts['model_params'],
+    'test_metrics': test_metrics,
+    'training_metrics': train_metrics,
+    'validation_metrics': val_metrics,
+    'metadata': model_artifacts['metadata'],
+    'feature_columns': feature_cols,
+    'sequence_length': SEQUENCE_LENGTH,
+    'forecast_horizon': FORECAST_HORIZON
+}
+
+metadata_path = os.path.join(MODEL_DIR, 'model_metadata.json')
+with open(metadata_path, 'w') as f:
+    json.dump(metadata, f, indent=4, default=str)
+
+# Save training history
+if 'history' in locals():
+    history_df = pd.DataFrame(history.history)
+    history_csv_path = os.path.join(MODEL_DIR, 'training_history.csv')
+    history_df.to_csv(history_csv_path, index=False)
+
+print("\n" + "="*50)
+print("FILES SAVED IN 'LSTM_model' DIRECTORY")
+print("="*50)
+print(f"1. lstm_model_artifacts.pkl - Consolidated file with all artifacts")
+print(f"2. model_metadata.json - Model parameters and metrics")
+print(f"3. lstm_results.png - Model performance plots")
+print(f"4. lstm_weekly_forecast.png - Weekly forecast visualization")
 if 'forecast_df' in locals():
-    print("7. lstm_pm25_7day_forecast.csv - Forecast data")
+    print(f"9. lstm_pm25_7day_forecast.csv - Forecast data")
+if 'history' in locals():
+    print(f"10. training_history.csv - Training history")
+print(f"11. best_lstm_model.keras - Best model from checkpoint")
+
+print("\n" + "="*50)
+print("HOW TO LOAD THE CONSOLIDATED MODEL ARTIFACTS")
+print("="*50)
+print("""
+# Load all artifacts at once:
+import pickle
+
+with open('LSTM_model/lstm_model_artifacts.pkl', 'rb') as f:
+    artifacts = pickle.load(f)
+
+model = artifacts['model']
+scaler_features = artifacts['scaler_features']
+scaler_target = artifacts['scaler_target']
+feature_cols = artifacts['feature_cols']
+model_params = artifacts['model_params']
+test_metrics = artifacts['test_metrics']
+
+# Use forecast function:
+forecast_func = artifacts['forecast_functions']['forecast_pm25_lstm']
+prediction = forecast_func(model, scaler_features, scaler_target, 
+                          recent_data, feature_cols)
+""")
 
 print("\n" + "="*50)
 print("PERFORMANCE SUMMARY")
 print("="*50)
 print(f"Sequence Length: {SEQUENCE_LENGTH} hours")
 print(f"Forecast Horizon: {FORECAST_HORIZON} hour(s)")
-print(f"Test R² Score: {test_metrics[2]:.4f}")
-print(f"Test MAE: {test_metrics[0]:.2f} μg/m³")
-print(f"Test RMSE: {test_metrics[1]:.2f} μg/m³")
+print(f"Test R² Score: {test_metrics['r2']:.4f}")
+print(f"Test MAE: {test_metrics['mae']:.2f} μg/m³")
+print(f"Test RMSE: {test_metrics['rmse']:.2f} μg/m³")
 print("="*50)
