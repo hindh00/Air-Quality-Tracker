@@ -1,0 +1,54 @@
+{
+    "model_params": {
+        "sequence_length": 24,
+        "forecast_horizon": 1,
+        "input_shape": [
+            24,
+            15
+        ],
+        "n_features": 15
+    },
+    "test_metrics": {
+        "mae": 6.461581472646476,
+        "rmse": 8.503523630158144,
+        "r2": 0.6695368995443477,
+        "mape": 16.25189352959156
+    },
+    "training_metrics": {
+        "mae": 3.8672918269820866,
+        "rmse": 5.586626588902084,
+        "r2": 0.9117819209666086,
+        "mape": 11.578748797949142
+    },
+    "validation_metrics": {
+        "mae": 5.732922190173433,
+        "rmse": 7.534247396331322,
+        "r2": 0.6574933578452212,
+        "mape": 21.46063565658919
+    },
+    "metadata": {
+        "creation_date": "2025-12-09 21:07:37",
+        "data_source": "final_training_data_all_regions.csv",
+        "region": "doha",
+        "target_column": "pm2_5 (\u03bcg/m\u00b3)"
+    },
+    "feature_columns": [
+        "temperature_2m (\u00b0C)",
+        "relative_humidity_2m (%)",
+        "wind_speed_10m (km/h)",
+        "wind_direction_10m (\u00b0)",
+        "pm10 (\u03bcg/m\u00b3)",
+        "carbon_monoxide (\u03bcg/m\u00b3)",
+        "nitrogen_dioxide (\u03bcg/m\u00b3)",
+        "ozone (\u03bcg/m\u00b3)",
+        "dust (\u03bcg/m\u00b3)",
+        "hour_sin",
+        "hour_cos",
+        "day_sin",
+        "day_cos",
+        "month_sin",
+        "month_cos"
+    ],
+    "sequence_length": 24,
+    "forecast_horizon": 1
+}
