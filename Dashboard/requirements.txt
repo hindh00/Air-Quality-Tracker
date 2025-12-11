@@ -1,3 +1,9 @@
 streamlit
 pandas
-requests
+numpy
+tensorflow
+scikit-learn
+openmeteo-requests
+requests-cache
+retry-requests
+pydeck
