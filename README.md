@@ -1,3 +1,4 @@
+
 # 🌍 Qatar Air Quality AI Forecaster (Group 8)
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
@@ -50,7 +51,7 @@ This project solves the lack of predictive insight in current monitoring systems
 ├── Presentation/               # Project Slides (Group 8).pptx
 ├── Report/                     # Final PDF Report
 └── README.md                   # Project Documentation
-```
+````
 
 -----
 
@@ -76,7 +77,6 @@ Navigate to the Dashboard folder and install dependencies:
 cd Dashboard
 # Create a virtual environment (optional but recommended)
 python -m venv venv
-
 # Windows:
 venv\Scripts\activate
 # Mac/Linux:
@@ -141,12 +141,13 @@ We evaluated three architectures. The **Bidirectional LSTM** was selected for pr
 
 **Samsung Innovation Campus**
 
-  * **Abdelbari Kecita**
-  * **Munieb Abdelrahman**
+  * **Abdelbari Kecita** 
+  * **Munieb Abdelrahman** 
   * **Hind Almutasim Hassan**
   * **Sharon Navaratnam**
   * **Raghad Sanosi**
   * **Wahed Shaik**
+  
 
 -----
 
