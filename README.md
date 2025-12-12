@@ -32,10 +32,10 @@ A deep learning system that predicts PM2.5 concentrations (fine particulate matt
 
 ## Installation
 - Install dependencies:
-  pip install -r requirements.txt
+  * pip install -r requirements.txt
   
 - Run the dashboard:
-  streamlit run Dashboard/app.py
+  * streamlit run Dashboard/app.py
 
 # Usage
 ## Web Dashboard
