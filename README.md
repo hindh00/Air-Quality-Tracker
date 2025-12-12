@@ -2,7 +2,7 @@
 
 A deep learning system that predicts PM2.5 concentrations (fine particulate matter) with 24-hour lead time across six municipalities in Qatar. The system integrates satellite data, meteorological information, and ground-level simulations to provide actionable air quality forecasts.
 
-# Features
+# Project Features
 - 24-Hour PM2.5 Forecasting: Accurate predictions with 92% global accuracy
 
 - Multi-Region Coverage: Doha, Al Khor, Al Rayyan, Al Wakrah, Umm Slal Ali, and Qatar (General)
@@ -16,7 +16,7 @@ A deep learning system that predicts PM2.5 concentrations (fine particulate matt
 - Simulation Mode: Test forecasting capabilities using historical data
 
 
-# Key Features (19 Total)
+# Key Data Features (19 Total)
 - Target: PM2.5 concentration
 - Meteorological: Temperature, Humidity, Wind Speed/Direction
 - Pollution Indicators: NO₂, Dust, Aerosol Optical Depth
