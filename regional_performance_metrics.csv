@@ -1,8 +1,0 @@
-Region,RMSE,MAE,R2 Score
-doha,3.97,2.65,0.9165
-rayyan,4.01,2.66,0.9149
-khor,4.05,2.69,0.9188
-wakrah,4.11,2.77,0.9106
-GLOBAL (Combined),4.2,2.82,0.9086
-ummsalal,4.44,3.01,0.8976
-qatar,4.56,3.12,0.8921
